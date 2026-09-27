@@ -13,7 +13,7 @@ A transfer-learning image classifier built with **TensorFlow / Keras** and **Eff
 - [Setup](#setup)
 - [How to Run](#how-to-run)
 - [Configuration Parameters](#configuration-parameters)
-- [Setting the Epochs (Important)](#setting-the-epochs-important)
+- [Training Strategy and Epochs](#training-strategy-and-epochs)
 - [Model Output](#model-output)
 - [Evaluation](#evaluation)
 - [Notes and Troubleshooting](#notes-and-troubleshooting)
@@ -29,10 +29,11 @@ The notebook (`image-classification-cricketer.ipynb`) trains an image classifica
 3. Balances the training set by trimming every class to an equal number of samples.
 4. Creates Keras `ImageDataGenerator` pipelines for training, validation, and testing.
 5. Builds a transfer-learning model on top of a frozen **EfficientNetB3** backbone.
-6. Trains the model using a custom callback that supports interactive checkpoints and automatic learning-rate decay.
-7. Plots training/validation loss and accuracy curves and identifies the best epoch.
-8. Evaluates the model on the test set (accuracy, F1 score, confusion matrix, classification report).
-9. Saves the trained model as a `.keras` file.
+6. Trains the model using `ModelCheckpoint`, `EarlyStopping`, and `ReduceLROnPlateau`, all monitoring **validation accuracy**.
+7. Reloads the best-performing checkpoint saved during training.
+8. Plots training/validation loss and accuracy curves.
+9. Evaluates the model on the test set (accuracy, F1 score, confusion matrix, classification report).
+10. Saves the final model as a `.keras` file.
 
 ---
 
@@ -65,25 +66,36 @@ Images are resized to **240 × 310** pixels.
 ### 4. Model architecture
 `make_model()` builds a transfer-learning classifier:
 - **Backbone:** EfficientNetB3 (`mod_num=3`), pretrained on ImageNet, with the top layers removed and the base **frozen** (not trainable).
-- **Head:** `BatchNormalization → Dense(256, L1/L2 regularized, ReLU) → Dropout(0.4) → Dense(4, Softmax)`.
+- **Head:** `BatchNormalization → Dense(256, L2-regularized, ReLU) → Dropout(0.4) → Dense(4, Softmax)`.
 - **Optimizer:** Adamax, initial learning rate `0.0001`.
 - **Loss:** categorical cross-entropy.
 
+The regularization on the Dense(256) layer was reduced from the original setup (L2 `0.016` plus L1 penalties on activity and bias) down to a single **L2 penalty of `0.001`**. The original settings pushed the raw loss value so low it no longer tracked classification quality, causing the "best epoch" to drift toward the very last epoch instead of where the model actually generalized best.
+
 The function also supports `EfficientNetB0`, `B5`, and `B7` by changing `mod_num`, if you want a lighter or heavier backbone.
 
-### 5. Custom training callback — `LR_ASK`
-This is the most important custom piece of logic in the notebook:
-- After every epoch, it checks the validation loss. If it improved, it stores the current model weights as the new "best weights."
-- If validation loss got worse, it automatically reduces the learning rate by a `factor` (default `0.4`) and restores the best weights so far (this behavior is controlled by `dwell=True`).
-- At a chosen checkpoint epoch (`ask_epoch`), it pauses training and asks you (via console input) whether to stop (`H`) or continue for a given number of additional epochs.
-- When training ends, it automatically reloads the **best-performing weights** recorded during the whole run, regardless of which epoch training actually stopped at.
+### 5. Training callbacks
+Training now uses three built-in Keras callbacks, all monitoring **`val_accuracy`** rather than loss:
 
-### 6. Visualization and evaluation
+- **`ModelCheckpoint`** — saves the model to `best_model.keras` every time validation accuracy reaches a new high, so the best checkpoint is always on disk even if training is interrupted.
+- **`EarlyStopping`** — stops training if validation accuracy hasn't improved for 5 epochs in a row, and automatically restores the model's weights from the best epoch seen (`restore_best_weights=True`).
+- **`ReduceLROnPlateau`** — cuts the learning rate by a factor of 0.4 if validation accuracy hasn't improved for 2 epochs, letting training keep refining instead of stalling.
+
+The notebook still contains an earlier custom callback, `LR_ASK`, which paused training with an interactive prompt and tracked the best epoch by validation **loss**. It is left in the notebook but is **no longer used** in the training cell, since it required manual input and its loss-based checkpoint selection was unreliable (see above).
+
+### 6. Loading the best checkpoint
+Immediately after training, the notebook runs:
+```python
+model = keras.models.load_model("best_model.keras")
+```
+This guarantees that all downstream plotting, evaluation, and saving use the actual best-accuracy checkpoint, even if the notebook is re-run out of order or the kernel is restarted later.
+
+### 7. Visualization and evaluation
 - `tr_plot()` plots training/validation loss and accuracy curves and marks the best epoch on each chart.
 - `predictor()` runs the trained model on the test set, prints accuracy and a weighted F1 score, and displays a confusion matrix and classification report.
 
-### 7. Saving the model
-The trained model is saved as a `.keras` file with a name that encodes the number of classes, image size, and final F1 score, e.g. `CRICKET-4-(240 X 310)-zeyam-96.50.keras`.
+### 8. Saving the model
+The trained model is saved as a `.keras` file with a name that encodes the number of classes, image size, and final F1 score, e.g. `CRICKET-4-(240 X 310)-zeyam-96.50.keras`. This cell depends on `classes`, `img_size`, `f1score`, and `model` all already existing in the session, so `predictor(test_gen)` must be run before it.
 
 ---
 
@@ -150,21 +162,18 @@ pip install -r requirements.txt
 ## How to Run
 
 1. Open the notebook in Jupyter Lab/Notebook, Google Colab, or Kaggle Notebooks.
-2. Run the cells **in order, from top to bottom** — later cells depend on variables created earlier (`train_df`, `classes`, `model`, etc.).
+2. Run the cells **in order, from top to bottom** — later cells depend on variables created earlier (`train_df`, `classes`, `model`, etc.). If you edit an earlier cell, re-run it and every cell after it.
 3. When the dataset download cell runs, confirm the printed path matches where the images were saved.
-4. When training reaches the `ask_epoch` checkpoint (epoch 10 by default), the notebook will pause and print a prompt in the output. Type:
-   - `H` to stop training and keep the best weights found so far, or
-   - a number (e.g. `5`) to continue training for that many more epochs before being asked again.
-5. After training finishes, run the plotting cell to see the loss/accuracy curves, then the evaluation cell to see test accuracy, F1 score, and the confusion matrix.
-6. Run the final cells to save the trained `.keras` model file.
+4. Run the training cell. Training now runs **straight through without pausing for input** — there is no interactive prompt, so it's safe to run non-interactively (e.g. as a script or in Kaggle's "Save & Run All").
+5. Run the checkpoint-loading cell (`model = keras.models.load_model("best_model.keras")`) so the rest of the notebook uses the correct best-accuracy model.
+6. Run the plotting cell to see the loss/accuracy curves, then the evaluation cell to see test accuracy, F1 score, and the confusion matrix.
+7. Run the final cells to save the trained `.keras` model file.
 
-> **Important:** Because the training callback uses Python's `input()` to ask whether to continue, it only works in an **interactive** environment (Jupyter, Colab, Kaggle). Running the notebook as a plain non-interactive script will hang at that prompt unless you set `ask_epoch` to a value greater than or equal to `epochs` (see below) so it never asks.
+> **On Kaggle:** `best_model.keras` and the final named `.keras` file are both saved under `/kaggle/working/`. Files there only persist for the current session unless you **Save Version** (commit the notebook) — download them or commit right after training if you want to keep them.
 
 ---
 
 ## Configuration Parameters
-
-These are the key variables you can change, and where they appear in the notebook:
 
 | Parameter | Location | Default | Purpose |
 |---|---|---|---|
@@ -172,46 +181,40 @@ These are the key variables you can change, and where they appear in the noteboo
 | `batch_size` | Cell calling `make_gens()` | `20` | Number of images per training/validation batch. |
 | `mod_num` | `make_model()` call | `3` (EfficientNetB3) | Which EfficientNet backbone to use (`0`, `3`, `5`, or other → `B7`). |
 | `lr` | `make_model()` call | `0.0001` | Initial learning rate for the Adamax optimizer. |
-| `epochs` | Training cell | `20` | Maximum number of training epochs. |
-| `ask_epoch` | Training cell | `10` | Epoch at which training pauses to ask whether to continue. |
-| `dwell` | `LR_ASK(...)` call | `True` | If `True`, automatically reduces the learning rate and reloads best weights whenever validation loss worsens. |
-| `factor` | `LR_ASK(...)` call | `0.4` | Multiplier applied to the learning rate when `dwell` triggers a reduction. |
+| `epochs` | Training cell | `30` | Maximum number of training epochs. |
+| `monitor` (all three callbacks) | Training cell | `val_accuracy` | Metric used to decide the best checkpoint, when to stop, and when to reduce the learning rate. |
+| `patience` (`EarlyStopping`) | Training cell | `5` | Epochs to wait without improvement before stopping. |
+| `patience` (`ReduceLROnPlateau`) | Training cell | `2` | Epochs to wait without improvement before cutting the learning rate. |
+| `factor` (`ReduceLROnPlateau`) | Training cell | `0.4` | Multiplier applied to the learning rate when it's reduced. |
 
 ---
 
-## Setting the Epochs (Important)
+## Training Strategy and Epochs
 
-There are two epoch-related settings, and they work together:
+`epochs = 30` is only an upper bound, not a fixed training length. The actual stopping point and the model that gets kept are both decided automatically:
 
-- **`epochs`** — the maximum number of epochs the training loop is allowed to run.
-- **`ask_epoch`** — the checkpoint at which training pauses so you can decide whether to stop or continue.
+- **Best checkpoint:** `ModelCheckpoint` saves `best_model.keras` every time validation accuracy improves.
+- **Stopping point:** `EarlyStopping` halts training once validation accuracy stops improving for 5 straight epochs, and restores the best-epoch weights into `model` in memory.
+- **Learning rate:** `ReduceLROnPlateau` shrinks the learning rate whenever validation accuracy stalls for 2 epochs, helping the model keep improving in smaller steps instead of stalling out early or overshooting.
 
-### How the "best epoch" is chosen
-You do not need to manually guess the best epoch. The `LR_ASK` callback tracks validation loss after every epoch and keeps a copy of the model weights whenever validation loss reaches a new low. When training ends (whether it runs the full `epochs` count or you halt it early), the callback **automatically reloads the best weights it saved**, not just whatever the last epoch produced. The `tr_plot()` function also marks this best epoch visually on the loss/accuracy charts after training, so you can confirm it.
+Because all three callbacks watch **accuracy** instead of raw loss, the selected "best" epoch now reflects actual classification performance. This matters here specifically because the model's loss includes a regularization term that can keep falling even when accuracy plateaus or drops, which previously caused the wrong epoch to be selected.
 
-### Recommended epoch settings for this dataset
-With ~3,300 training images spread evenly across 4 classes and a **frozen** EfficientNetB3 backbone (only the small classification head is being trained), the model typically converges quickly:
-
-- **Total epochs (`epochs`):** `20–25` is a good starting range. Since the callback restores the best weights automatically, setting this a bit higher than you need is safe and costs little beyond extra training time.
-- **Checkpoint (`ask_epoch`):** `8–10` works well for monitoring progress partway through. Because `dwell=True` already auto-decays the learning rate on plateaus and restores best weights, you often don't need to intervene at the checkpoint — entering a number to continue (e.g. `10` more epochs) is usually enough.
-- **Best epoch in practice:** for a dataset and model of this size, the lowest validation loss usually appears somewhere between **epoch 8 and epoch 15**; training beyond that mainly risks overfitting the small classification head, which the callback's weight-restoring behavior already guards against.
-- **Running unattended (no manual input):** set `ask_epoch = epochs` (e.g. both `20`) so the condition `ask_epoch >= epochs` is met and the callback trains straight through without pausing for input.
-
-If you unfreeze the EfficientNetB3 base for fine-tuning later, expect to need more epochs (typically 25–40) and a lower learning rate, since you would then be training many more parameters.
+You generally do not need to change `epochs` upward, since `EarlyStopping` will stop training on its own once it stops helping. Lowering `epochs` only matters if you want a hard time/compute limit regardless of whether training has plateaued.
 
 ---
 
 ## Model Output
 
-The trained model is saved as:
+Two model files are produced:
 
-```
-<working_dir>/CRICKET-<num_classes>-(<height> X <width>)-zeyam-<f1_score>.keras
-```
+1. **`best_model.keras`** — written automatically during training by `ModelCheckpoint`, representing the epoch with the highest validation accuracy.
+2. **The final named export**, produced after evaluation:
+   ```
+   <working_dir>/CRICKET-<num_classes>-(<height> X <width>)-zeyam-<f1_score>.keras
+   ```
+   Example: `CRICKET-4-(240 X 310)-zeyam-96.50.keras`
 
-Example: `CRICKET-4-(240 X 310)-zeyam-96.50.keras`
-
-By default the save path is `/kaggle/working/...`, which only exists on Kaggle. If running locally or in Colab, change `model_save_loc` to a folder on your own machine or Google Drive.
+By default the final save path is `/kaggle/working/...`, which only exists on Kaggle. If running locally or in Colab, change `model_save_loc` to a folder on your own machine or Google Drive.
 
 ---
 
@@ -229,6 +232,8 @@ After training, the notebook reports:
 
 - **Slow training / no GPU:** EfficientNetB3 is a fairly large backbone. On CPU-only machines, expect significantly longer epoch times; consider Google Colab or Kaggle Notebooks, which provide free GPU access.
 - **Kaggle authentication errors:** double-check `kaggle.json` placement or the `KAGGLE_USERNAME` / `KAGGLE_KEY` environment variables.
-- **Training seems "stuck":** if running outside a notebook, it is likely waiting on the `input()` prompt from `LR_ASK` — set `ask_epoch >= epochs` to avoid this.
+- **`NameError` on the save cell:** the final save cell needs `classes`, `img_size`, `f1score`, and `model` to already exist. Run the checkpoint-loading cell and `predictor(test_gen)` before it.
+- **Interrupted training cell:** stopping a cell mid-run does not reset `model`'s weights, but it does prevent `history` from being reassigned. To resume, call `model.fit(...)` again with `initial_epoch` set to the number of epochs already completed, and merge the two `History` objects before plotting.
+- **Stale plots:** `tr_plot(history, 0)` always plots whatever `history` currently holds. If a training cell fails or is interrupted before finishing, `history` still refers to the previous successful run. Restart the kernel and re-run all cells top to bottom if the plots look outdated.
 - **Out-of-memory errors:** lower `batch_size` (e.g. from 20 to 8 or 16), or switch to a smaller backbone (`mod_num=0` for EfficientNetB0).
 - **Different dataset:** if you swap in a different image dataset, update the folder structure to match (one subfolder per class) and adjust `img_size` if aspect ratios differ significantly.
